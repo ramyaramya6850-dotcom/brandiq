@@ -1,0 +1,78 @@
+{
+  "accuracy": 0.9418472063854048,
+  "precision_weighted": 0.934751449211042,
+  "recall_weighted": 0.9418472063854048,
+  "f1_weighted": 0.9381828936348982,
+  "classification_report": {
+    "GOOD": {
+      "precision": 0.9700598802395209,
+      "recall": 0.9794437726723095,
+      "f1-score": 0.9747292418772563,
+      "support": 827.0
+    },
+    "NEUTRAL": {
+      "precision": 0.46875,
+      "recall": 0.4411764705882353,
+      "f1-score": 0.45454545454545453,
+      "support": 34.0
+    },
+    "BAD": {
+      "precision": 0.1,
+      "recall": 0.0625,
+      "f1-score": 0.07692307692307693,
+      "support": 16.0
+    },
+    "accuracy": 0.9418472063854048,
+    "macro avg": {
+      "precision": 0.512936626746507,
+      "recall": 0.4943734144201816,
+      "f1-score": 0.5020659244485959,
+      "support": 877.0
+    },
+    "weighted avg": {
+      "precision": 0.934751449211042,
+      "recall": 0.9418472063854048,
+      "f1-score": 0.9381828936348982,
+      "support": 877.0
+    }
+  },
+  "confusion_matrix": [
+    [
+      810,
+      10,
+      7
+    ],
+    [
+      17,
+      15,
+      2
+    ],
+    [
+      8,
+      7,
+      1
+    ]
+  ],
+  "labels": [
+    "GOOD",
+    "NEUTRAL",
+    "BAD"
+  ],
+  "training_rows": 3507,
+  "testing_rows": 877,
+  "total_prepared_rows": 4384,
+  "training_distribution": {
+    "GOOD": 3305,
+    "NEUTRAL": 136,
+    "BAD": 66
+  },
+  "testing_distribution": {
+    "GOOD": 827,
+    "NEUTRAL": 34,
+    "BAD": 16
+  },
+  "model": "TF-IDF Word + Character Ngrams + Logistic Regression",
+  "solver": "lbfgs",
+  "real_dataset": true,
+  "dataset_path": "C:\\Users\\Mugunthan\\Downloads\\project 2028\\brand-reputation-analysis\\data\\raw\\consumer_reviews.csv"
+}
