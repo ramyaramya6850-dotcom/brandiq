@@ -219,11 +219,11 @@ def model_ready(kind):
 
 def apply_sentiment_model(df):
     """
-    Run the saved trained sentiment model on review text.
+    Run the saved trained sentiment model on review text in small batches.
 
-    This is inference for uploaded/application data. The rating-derived
-    sentiment created by preprocess.py is used only as the training label;
-    application analytics use the saved ML model prediction instead.
+    The uploaded dataset is processed with the real trained TF-IDF +
+    classifier model. Batching keeps peak memory lower on Render Free while
+    preserving the same ML predictions.
     """
     if "review_text" not in df.columns:
         raise HTTPException(
@@ -241,29 +241,53 @@ def apply_sentiment_model(df):
         )
 
     try:
+        # Keep the original dataframe intact and release temporary objects
+        # between batches. This is important for low-memory Render instances.
+        result = df.copy()
+        texts = result["review_text"].fillna("").astype(str).tolist()
+
         model = joblib.load(MODELS / "sentiment_model.pkl")
         vectorizer = joblib.load(MODELS / "sentiment_vectorizer.pkl")
 
-        texts = df["review_text"].fillna("").astype(str)
-        features = vectorizer.transform(texts)
-        predictions = model.predict(features)
+        batch_size = 250
+        predictions_all = []
+        confidence_all = []
+        has_probability = hasattr(model, "predict_proba")
 
-        result = df.copy()
-        result["sentiment"] = (
-            pd.Series(predictions, index=result.index)
-            .astype(str)
-            .str.upper()
-            .str.strip()
+        for start in range(0, len(texts), batch_size):
+            batch_texts = texts[start:start + batch_size]
+            features = vectorizer.transform(batch_texts)
+
+            predictions = model.predict(features)
+            predictions_all.extend(
+                pd.Series(predictions)
+                .astype(str)
+                .str.upper()
+                .str.strip()
+                .tolist()
+            )
+
+            if has_probability:
+                probabilities = model.predict_proba(features)
+                confidence_all.extend(
+                    probabilities.max(axis=1).astype(float).tolist()
+                )
+
+            # Explicitly drop the largest temporary sparse matrix before the
+            # next batch so memory can be reclaimed on small instances.
+            del features
+            if has_probability:
+                del probabilities
+
+        result["sentiment"] = predictions_all
+        result["sentiment_confidence"] = (
+            confidence_all if has_probability else np.nan
         )
-
-        if hasattr(model, "predict_proba"):
-            probabilities = model.predict_proba(features)
-            result["sentiment_confidence"] = probabilities.max(axis=1)
-        else:
-            result["sentiment_confidence"] = np.nan
 
         return result
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -708,6 +732,13 @@ def map_dataset(
             )
         )
 
+        # Keep the original row count before releasing the raw dataframe.
+        raw_row_count = len(raw)
+
+        # The raw dataframe is no longer needed after validation. Release it
+        # before loading the ML model so peak memory stays lower on Render.
+        del raw
+
         # validate_and_prepare creates rating-derived labels for training
         # compatibility. For application data, replace those labels with
         # predictions from the real trained sentiment model.
@@ -746,7 +777,7 @@ def map_dataset(
             clean.columns
         ),
         "duplicates_removed": int(
-            len(raw) - len(clean)
+            raw_row_count - len(clean)
         ),
     }
 
