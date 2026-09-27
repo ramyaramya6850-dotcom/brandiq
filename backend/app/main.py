@@ -241,23 +241,25 @@ def apply_sentiment_model(df):
         )
 
     try:
-        # Keep the original dataframe intact and release temporary objects
-        # between batches. This is important for low-memory Render instances.
-        result = df.copy()
+        # Work on the existing dataframe instead of making another full copy.
+        # Render Free has limited RAM, so avoid duplicate dataframes while the
+        # TF-IDF model is running.
+        result = df
         texts = result["review_text"].fillna("").astype(str).tolist()
 
         model = joblib.load(MODELS / "sentiment_model.pkl")
         vectorizer = joblib.load(MODELS / "sentiment_vectorizer.pkl")
 
-        batch_size = 250
+        # Smaller batches reduce peak memory on Render Free.
+        batch_size = 100
         predictions_all = []
-        confidence_all = []
-        has_probability = hasattr(model, "predict_proba")
 
         for start in range(0, len(texts), batch_size):
             batch_texts = texts[start:start + batch_size]
             features = vectorizer.transform(batch_texts)
 
+            # The real trained classifier is still used. We skip predict_proba
+            # because its extra array can cause a memory spike on Free.
             predictions = model.predict(features)
             predictions_all.extend(
                 pd.Series(predictions)
@@ -267,22 +269,11 @@ def apply_sentiment_model(df):
                 .tolist()
             )
 
-            if has_probability:
-                probabilities = model.predict_proba(features)
-                confidence_all.extend(
-                    probabilities.max(axis=1).astype(float).tolist()
-                )
-
-            # Explicitly drop the largest temporary sparse matrix before the
-            # next batch so memory can be reclaimed on small instances.
             del features
-            if has_probability:
-                del probabilities
+            del predictions
 
         result["sentiment"] = predictions_all
-        result["sentiment_confidence"] = (
-            confidence_all if has_probability else np.nan
-        )
+        result["sentiment_confidence"] = np.nan
 
         return result
 
