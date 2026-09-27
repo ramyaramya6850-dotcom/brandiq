@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import uuid
 import sys
+import gc
 from pathlib import Path
 from datetime import datetime
 from io import BytesIO
@@ -46,6 +47,7 @@ sys.path.append(str(ROOT / "ml"))
 
 from preprocess import (
     validate_and_prepare,
+    canonicalize_columns,
     reputation_aggregate,
 )
 
@@ -219,11 +221,10 @@ def model_ready(kind):
 
 def apply_sentiment_model(df):
     """
-    Run the saved trained sentiment model on review text in small batches.
+    Run the saved trained sentiment model on a dataframe in small batches.
 
-    The uploaded dataset is processed with the real trained TF-IDF +
-    classifier model. Batching keeps peak memory lower on Render Free while
-    preserving the same ML predictions.
+    This function is kept for already-processed datasets. New uploads use
+    the chunked map pipeline below, which keeps the full CSV out of memory.
     """
     if "review_text" not in df.columns:
         raise HTTPException(
@@ -241,25 +242,15 @@ def apply_sentiment_model(df):
         )
 
     try:
-        # Work on the existing dataframe instead of making another full copy.
-        # Render Free has limited RAM, so avoid duplicate dataframes while the
-        # TF-IDF model is running.
-        result = df
-        texts = result["review_text"].fillna("").astype(str).tolist()
-
         model = joblib.load(MODELS / "sentiment_model.pkl")
         vectorizer = joblib.load(MODELS / "sentiment_vectorizer.pkl")
-
-        # Smaller batches reduce peak memory on Render Free.
-        batch_size = 100
+        result = df
+        texts = result["review_text"].fillna("").astype(str).tolist()
         predictions_all = []
 
-        for start in range(0, len(texts), batch_size):
-            batch_texts = texts[start:start + batch_size]
+        for start in range(0, len(texts), 100):
+            batch_texts = texts[start:start + 100]
             features = vectorizer.transform(batch_texts)
-
-            # The real trained classifier is still used. We skip predict_proba
-            # because its extra array can cause a memory spike on Free.
             predictions = model.predict(features)
             predictions_all.extend(
                 pd.Series(predictions)
@@ -268,13 +259,12 @@ def apply_sentiment_model(df):
                 .str.strip()
                 .tolist()
             )
-
-            del features
-            del predictions
+            del batch_texts, features, predictions
 
         result["sentiment"] = predictions_all
         result["sentiment_confidence"] = np.nan
-
+        del texts, predictions_all, model, vectorizer
+        gc.collect()
         return result
 
     except HTTPException:
@@ -284,6 +274,30 @@ def apply_sentiment_model(df):
             status_code=500,
             detail=f"Sentiment ML inference failed: {e}",
         )
+
+
+def predict_sentiment_chunk(df, model, vectorizer):
+    """Predict sentiment for one small dataframe chunk."""
+    texts = df["review_text"].fillna("").astype(str).tolist()
+    predictions_all = []
+
+    for start in range(0, len(texts), 100):
+        batch_texts = texts[start:start + 100]
+        features = vectorizer.transform(batch_texts)
+        predictions = model.predict(features)
+        predictions_all.extend(
+            pd.Series(predictions)
+            .astype(str)
+            .str.upper()
+            .str.strip()
+            .tolist()
+        )
+        del batch_texts, features, predictions
+
+    df["sentiment"] = predictions_all
+    df["sentiment_confidence"] = np.nan
+    del texts, predictions_all
+    return df
 
 
 # ---------------------------------------------------------
@@ -587,112 +601,90 @@ async def upload(
     db: Session = Depends(get_db),
 ):
 
-    ext = Path(
-        file.filename or ""
-    ).suffix.lower()
-
+    ext = Path(file.filename or "").suffix.lower()
     if ext not in ALLOWED_EXT:
-        raise HTTPException(
-            status_code=400,
-            detail="Only CSV files are supported.",
-        )
+        raise HTTPException(status_code=400, detail="Only CSV files are supported.")
 
-    data = await file.read()
-
-    if len(data) > MAX_UPLOAD_MB * 1024 * 1024:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File is larger than {MAX_UPLOAD_MB} MB.",
-        )
-
-    if not data:
-        raise HTTPException(
-            status_code=400,
-            detail="The uploaded CSV is empty.",
-        )
-
-    temp = (
-        DATA_RAW
-        / f"upload_{uuid.uuid4().hex}.csv"
-    )
-
-    temp.write_bytes(data)
+    temp = DATA_RAW / f"upload_{uuid.uuid4().hex}.csv"
+    total_size = 0
 
     try:
+        # Stream the uploaded file to disk instead of keeping the whole CSV
+        # in RAM. This is important for large uploads on Render Free.
+        with temp.open("wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total_size += len(chunk)
+                if total_size > MAX_UPLOAD_MB * 1024 * 1024:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File is larger than {MAX_UPLOAD_MB} MB.",
+                    )
+                out.write(chunk)
 
-        raw = pd.read_csv(
+        if total_size == 0:
+            raise HTTPException(status_code=400, detail="The uploaded CSV is empty.")
+
+        # Only inspect the header here. Do not load all rows just to show the
+        # mapping screen.
+        header = pd.read_csv(temp, nrows=0)
+        columns = [str(c) for c in header.columns]
+        if not columns:
+            raise HTTPException(status_code=400, detail="The CSV contains no columns.")
+
+        # Count rows by reading one column in chunks, keeping memory bounded.
+        row_count = 0
+        for piece in pd.read_csv(
             temp,
-            low_memory=False,
-        )
+            usecols=[header.columns[0]],
+            chunksize=5000,
+        ):
+            row_count += len(piece)
+            del piece
+        if row_count == 0:
+            raise HTTPException(status_code=400, detail="The CSV contains no rows.")
 
+        ds = Dataset(
+            user_id=user.id,
+            original_filename=file.filename or "upload.csv",
+            stored_path=str(temp),
+            row_count=row_count,
+            columns_json=json.dumps(columns),
+            mapping_json="{}",
+        )
+        db.add(ds)
+        db.commit()
+        db.refresh(ds)
+
+        import preprocess
+        aliases = {c: list(v) for c, v in preprocess.ALIASES.items()}
+        auto_mapping = canonicalize_columns(header)[1]
+
+        del header
+        gc.collect()
+
+        return {
+            "dataset_id": ds.id,
+            "filename": ds.original_filename,
+            "file_size": total_size,
+            "row_count": row_count,
+            "columns": columns,
+            "aliases": aliases,
+            "auto_mapping": auto_mapping,
+        }
+
+    except HTTPException:
+        temp.unlink(missing_ok=True)
+        raise
     except Exception as e:
-
-        temp.unlink(
-            missing_ok=True
-        )
-
-        raise HTTPException(
-            status_code=400,
-            detail=f"Could not read CSV: {e}",
-        )
-
-    if raw.empty:
-
-        temp.unlink(
-            missing_ok=True
-        )
-
-        raise HTTPException(
-            status_code=400,
-            detail="The CSV contains no rows.",
-        )
-
-    ds = Dataset(
-        user_id=user.id,
-        original_filename=(
-            file.filename
-            or "upload.csv"
-        ),
-        stored_path=str(temp),
-        row_count=len(raw),
-        columns_json=json.dumps(
-            [str(c) for c in raw.columns]
-        ),
-        mapping_json="{}",
-    )
-
-    db.add(ds)
-    db.commit()
-    db.refresh(ds)
-
-    import preprocess
-
-    aliases = {
-        c: list(v)
-        for c, v in preprocess.ALIASES.items()
-    }
-
-    auto_mapping = (
-        preprocess
-        .canonicalize_columns(raw)[1]
-    )
-
-    return {
-        "dataset_id": ds.id,
-        "filename": ds.original_filename,
-        "file_size": len(data),
-        "row_count": len(raw),
-        "columns": [
-            str(c)
-            for c in raw.columns
-        ],
-        "aliases": aliases,
-        "auto_mapping": auto_mapping,
-    }
+        temp.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=f"Could not read CSV: {e}")
 
 
 # ---------------------------------------------------------
-# MAP DATASET
+# MAP DATASET - CHUNKED FOR LARGE CSV FILES
 # ---------------------------------------------------------
 
 @app.post("/api/datasets/{dataset_id}/map")
@@ -703,74 +695,117 @@ def map_dataset(
     db: Session = Depends(get_db),
 ):
 
-    ds = dataset_for(
-        dataset_id,
-        user,
-        db,
-    )
+    ds = dataset_for(dataset_id, user, db)
 
-    raw = pd.read_csv(
-        ds.stored_path,
-        low_memory=False,
-    )
-
-    try:
-
-        clean, resolved = (
-            validate_and_prepare(
-                raw,
-                payload.mapping,
-            )
+    if not model_ready("sentiment"):
+        raise HTTPException(
+            status_code=409,
+            detail="Sentiment ML model is not available. Run train_sentiment_model.py first.",
         )
 
-        # Keep the original row count before releasing the raw dataframe.
-        raw_row_count = len(raw)
+    out = processed_path(ds)
+    out.unlink(missing_ok=True)
 
-        # The raw dataframe is no longer needed after validation. Release it
-        # before loading the ML model so peak memory stays lower on Render.
-        del raw
+    # Load the trained artifacts once. They are reused for every CSV chunk.
+    model = joblib.load(MODELS / "sentiment_model.pkl")
+    vectorizer = joblib.load(MODELS / "sentiment_vectorizer.pkl")
 
-        # validate_and_prepare creates rating-derived labels for training
-        # compatibility. For application data, replace those labels with
-        # predictions from the real trained sentiment model.
-        clean = apply_sentiment_model(clean)
+    resolved_mapping = {}
+    total_clean = 0
+    total_duplicates = 0
+    seen_keys = set()
+    first_write = True
+
+    try:
+        # 1,000 rows is deliberately small for Render Free. The CSV itself
+        # can be much larger; only one chunk is in memory at a time.
+        for raw in pd.read_csv(
+            ds.stored_path,
+            chunksize=1000,
+            low_memory=True,
+        ):
+            raw_count = len(raw)
+
+            clean, resolved = validate_and_prepare(raw, payload.mapping)
+            resolved_mapping.update(resolved)
+
+            del raw
+
+            if clean.empty:
+                del clean
+                gc.collect()
+                continue
+
+            # Global duplicate protection without keeping another dataframe.
+            # The set contains compact integer hashes rather than full rows.
+            dedup_cols = [c for c in ["review_text", "rating", "date"] if c in clean.columns]
+            if dedup_cols:
+                keys = pd.util.hash_pandas_object(clean[dedup_cols], index=False)
+                keep = []
+                for value in keys.to_numpy():
+                    key = int(value)
+                    if key in seen_keys:
+                        keep.append(False)
+                    else:
+                        seen_keys.add(key)
+                        keep.append(True)
+                before = len(clean)
+                clean = clean.loc[keep].reset_index(drop=True)
+                total_duplicates += before - len(clean)
+                del keys, keep
+
+            if clean.empty:
+                del clean
+                gc.collect()
+                continue
+
+            # Replace the rating-derived labels with predictions from the
+            # actual trained sentiment model. No hardcoded prediction is used.
+            clean = predict_sentiment_chunk(clean, model, vectorizer)
+
+            clean.to_csv(
+                out,
+                mode="w" if first_write else "a",
+                header=first_write,
+                index=False,
+            )
+            first_write = False
+            total_clean += len(clean)
+
+            del clean
+            gc.collect()
+
+        if first_write or total_clean == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="No valid review rows remained after validation.",
+            )
+
+        ds.mapping_json = json.dumps(resolved_mapping)
+        ds.row_count = total_clean
+        db.commit()
+
+        return {
+            "dataset_id": ds.id,
+            "row_count": total_clean,
+            "resolved_mapping": resolved_mapping,
+            "available_columns": list(pd.read_csv(out, nrows=0).columns),
+            "duplicates_removed": int(total_duplicates),
+        }
 
     except HTTPException:
+        out.unlink(missing_ok=True)
         raise
-
     except Exception as e:
-
+        out.unlink(missing_ok=True)
+        db.rollback()
         raise HTTPException(
             status_code=400,
             detail=f"Dataset validation failed: {e}",
         )
-
-    out = processed_path(ds)
-
-    clean.to_csv(
-        out,
-        index=False,
-    )
-
-    ds.mapping_json = json.dumps(
-        resolved
-    )
-
-    ds.row_count = len(clean)
-
-    db.commit()
-
-    return {
-        "dataset_id": ds.id,
-        "row_count": len(clean),
-        "resolved_mapping": resolved,
-        "available_columns": list(
-            clean.columns
-        ),
-        "duplicates_removed": int(
-            raw_row_count - len(clean)
-        ),
-    }
+    finally:
+        del model, vectorizer, seen_keys
+        gc.collect()
 
 
 # ---------------------------------------------------------
